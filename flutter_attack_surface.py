@@ -73,6 +73,17 @@ def valid_host(host: str) -> bool:
     return bool(HOST_RE.fullmatch(host))
 
 
+def normalize_domain(value: str) -> str:
+    domain = value.lower().rstrip(".")
+    if not valid_host(domain):
+        raise ValueError(f"invalid --domain value: {value!r}; use a domain such as example.com")
+    return domain
+
+
+def in_domains(host: str, domains: tuple[str, ...]) -> bool:
+    return not domains or any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
 def wanted(path: Path, include_dex: bool, include_native: bool) -> bool:
     if path.name == "libapp.so":
         return True
@@ -100,7 +111,7 @@ def iter_inputs(source: str, include_dex: bool, include_native: bool):
                 yield file.relative_to(path).as_posix(), file.read_bytes()
 
 
-def scan_text(text: str, source: str, base: int, width: int, buckets: dict[str, Hits]):
+def scan_text(text: str, source: str, base: int, width: int, buckets: dict[str, Hits], domains: tuple[str, ...]):
     for match in URL_RE.finditer(text):
         raw = match.group(0).rstrip(".,;:)]}")
         try:
@@ -108,7 +119,7 @@ def scan_text(text: str, source: str, base: int, width: int, buckets: dict[str, 
             host = (parsed.hostname or "").lower().rstrip(".")
         except ValueError:
             continue
-        if not valid_host(host):
+        if not valid_host(host) or not in_domains(host, domains):
             continue
         offset = base + match.start() * width
         buckets["hosts"].add(host, source, offset)
@@ -124,24 +135,29 @@ def scan_text(text: str, source: str, base: int, width: int, buckets: dict[str, 
     without_urls = URL_RE.sub(lambda match: " " * len(match.group(0)), text)
     for match in HOST_RE.finditer(without_urls):
         host = match.group(0).lower()
-        if valid_host(host):
+        if valid_host(host) and in_domains(host, domains):
             buckets["hosts"].add(host, source, base + match.start() * width)
 
-    # Exclude URLs here: otherwise a hostname such as search.example.com can
-    # produce a false "/search" route candidate.
-    for match in API_PATH_RE.finditer(without_urls):
-        buckets["paths"].add(safe_path(match.group(0)), source, base + match.start() * width)
+    # Standalone paths and markers have no reliable host association. With a
+    # domain filter, only paths and query keys from matching URLs are reported.
+    if not domains:
+        # Exclude URLs here: otherwise a hostname such as search.example.com
+        # can produce a false "/search" route candidate.
+        for match in API_PATH_RE.finditer(without_urls):
+            buckets["paths"].add(safe_path(match.group(0)), source, base + match.start() * width)
 
-    for match in AUTH_RE.finditer(text):
-        buckets["auth_markers"].add(match.group(0).lower(), source, base + match.start() * width)
+        for match in AUTH_RE.finditer(text):
+            buckets["auth_markers"].add(match.group(0).lower(), source, base + match.start() * width)
 
-    # Report types and locations only; never print matched secret values.
-    for label, pattern in SECRET_PATTERNS.items():
-        for match in pattern.finditer(text):
-            buckets["secret_patterns"].add(label, source, base + match.start() * width)
+        # Report types and locations only; never print matched secret values.
+        for label, pattern in SECRET_PATTERNS.items():
+            for match in pattern.finditer(text):
+                buckets["secret_patterns"].add(label, source, base + match.start() * width)
 
 
-def analyze(source: str, include_dex: bool = False, include_native: bool = False) -> dict:
+def analyze(source: str, include_dex: bool = False, include_native: bool = False,
+            domains: list[str] | None = None) -> dict:
+    selected_domains = tuple(sorted({normalize_domain(value) for value in (domains or [])}))
     buckets = {key: Hits() for key in ("hosts", "urls", "paths", "query_keys", "auth_markers", "secret_patterns")}
     scanned = []
     for name, data in iter_inputs(source, include_dex, include_native):
@@ -151,19 +167,27 @@ def analyze(source: str, include_dex: bool = False, include_native: bool = False
         for pattern, encoding, width in ((ASCII_RE, "ascii", 1), (UTF16_RE, "utf-16le", 2)):
             for match in pattern.finditer(data):
                 text = match.group(0).decode(encoding, errors="replace")
-                scan_text(text, name, match.start(), width, buckets)
+                scan_text(text, name, match.start(), width, buckets, selected_domains)
     if not scanned:
         raise ValueError("no supported files found")
     return {
         "input": source,
+        "domains": list(selected_domains),
         "scanned_files": scanned,
         **{key: bucket.sorted() for key, bucket in buckets.items()},
-        "note": "Literal strings only. No Dart AOT decompilation, scope judgement, or network verification.",
+        "note": ("Literal strings only. Domain filtering omits standalone paths, auth markers, "
+                 "and secret shapes because they cannot be reliably tied to a host. "
+                 "No Dart AOT decompilation, scope judgement, or network verification.")
+                if selected_domains else
+                "Literal strings only. No Dart AOT decompilation, scope judgement, or network verification.",
     }
 
 
 def display(report: dict, limit: int):
     print(f"Files scanned: {len(report['scanned_files'])}")
+    if report["domains"]:
+        print(f"Domain filter: {', '.join(report['domains'])} (includes subdomains)")
+        print("Standalone paths, auth markers, and secret shapes omitted: no host association.")
     for key, title in (
         ("hosts", "Host candidates"), ("urls", "URLs (query values omitted)"),
         ("paths", "Path candidates"), ("query_keys", "Query parameter names"),
@@ -184,13 +208,15 @@ def main() -> int:
     parser.add_argument("input", help="artifact directory, file, or '-' for stdin")
     parser.add_argument("--include-dex", action="store_true", help="also scan classes*.dex")
     parser.add_argument("--include-native", action="store_true", help="also scan other .so files")
+    parser.add_argument("--domain", action="append", default=[], metavar="DOMAIN",
+                        help="keep this domain and its subdomains; repeat for multiple domains")
     parser.add_argument("--json-output", type=Path, help="write full candidate report as JSON")
     parser.add_argument("--max", type=int, default=50, help="maximum rows per text section")
     args = parser.parse_args()
     if args.max < 1:
         parser.error("--max must be at least 1")
     try:
-        report = analyze(args.input, args.include_dex, args.include_native)
+        report = analyze(args.input, args.include_dex, args.include_native, args.domain)
         if args.json_output:
             args.json_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     except (OSError, ValueError) as exc:

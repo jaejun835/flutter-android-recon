@@ -53,6 +53,22 @@ python3 flutter_attack_surface.py extracted --include-dex --include-native \
   --json-output candidates.json --max 30
 ```
 
+To reduce unrelated SDK and framework results, repeat `--domain` for each
+domain of interest. Each value includes its subdomains. The filter is based on
+literal hostnames; it does not decide whether a host is authorized for testing.
+
+```bash
+python3 flutter_attack_surface.py extracted --include-dex --include-native \
+  --domain example.com --domain example.org \
+  --json-output filtered-candidates.json --max 30
+```
+
+In filtered mode, hosts and URLs must match one of those domains. Paths and
+query parameter names are kept only when they occur in a matching URL.
+Standalone paths, auth markers, and secret shapes are omitted because the
+script cannot reliably associate them with a hostname. Run without `--domain`
+when reviewing those clues.
+
 `flutter_attack_surface.py` also accepts a single file or `-` for standard
 input. Text output is capped by `--max` per section; `--json-output` retains all
 candidates and up to three source offsets for each one.
