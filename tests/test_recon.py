@@ -64,6 +64,33 @@ class ExtractTests(unittest.TestCase):
 
 
 class TriageTests(unittest.TestCase):
+    def test_domain_filter_keeps_matching_urls_and_bare_hosts_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libapp.so"
+            binary.write_bytes(
+                b"https://api.example.com/v1/users?limit=10\x00"
+                b"https://other.test/api/private?token=secret\x00"
+                b"maps.example.com\x00/api/standalone\x00Bearer abcdefghijklmnop"
+            )
+            report = analyze(str(binary), domains=["example.com"])
+            self.assertEqual(report["domains"], ["example.com"])
+            self.assertEqual(
+                {row["value"] for row in report["hosts"]},
+                {"api.example.com", "maps.example.com"},
+            )
+            self.assertEqual(
+                {row["value"] for row in report["urls"]},
+                {"https://api.example.com/v1/users"},
+            )
+            self.assertEqual({row["value"] for row in report["paths"]}, {"/v1/users"})
+            self.assertEqual({row["value"] for row in report["query_keys"]}, {"limit"})
+            self.assertEqual(report["auth_markers"], [])
+            self.assertEqual(report["secret_patterns"], [])
+
+    def test_domain_filter_rejects_invalid_domain(self):
+        with self.assertRaises(ValueError):
+            analyze("unused", domains=["https://example.com"])
+
     def test_urls_are_redacted_and_bare_hosts_are_found(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "libapp.so"
